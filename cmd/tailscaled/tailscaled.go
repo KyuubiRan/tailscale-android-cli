@@ -72,6 +72,8 @@ import (
 // defaultTunName returns the default tun device name for the platform.
 func defaultTunName() string {
 	switch runtime.GOOS {
+	case "android":
+		return "tailscale0"
 	case "openbsd":
 		return "tun"
 	case "windows":
@@ -199,6 +201,7 @@ type proxyStartFunc = func(logf logger.Logf, dialer *tsdial.Dialer)
 
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
+
 	if shouldRunCLI() {
 		beCLI()
 		return
