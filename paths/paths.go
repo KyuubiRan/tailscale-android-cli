@@ -53,6 +53,9 @@ func WindowsDevTailscaledSocket() string {
 // DefaultTailscaledSocket returns the path to the tailscaled Unix socket
 // or the empty string if there's no reasonable default.
 func DefaultTailscaledSocket() string {
+	if runtime.GOOS == "android" {
+		return "/data/adb/shellscaled/run/tailscaled.sock"
+	}
 	if runtime.GOOS == "windows" {
 		return WindowsProtectedPipePrefix + `Tailscale\tailscaled`
 	}
@@ -131,7 +134,7 @@ func DefaultTailscaledStateDir() string {
 // when it's absent.
 func MakeAutomaticStateDir() bool {
 	switch runtime.GOOS {
-	case "plan9":
+	case "plan9", "android":
 		return true
 	case "linux":
 		if distro.Get() == distro.JetKVM {

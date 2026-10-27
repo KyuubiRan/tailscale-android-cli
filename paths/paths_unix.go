@@ -33,6 +33,8 @@ func statePath() string {
 		return "/Library/Tailscale/tailscaled.state"
 	case "aix":
 		return "/var/tailscale/tailscaled.state"
+	case "android":
+		return "/data/adb/shellscaled/state/tailscaled.state"
 	default:
 		return ""
 	}

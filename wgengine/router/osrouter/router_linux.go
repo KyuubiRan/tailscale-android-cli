@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !android
+//go:build linux
 
 package osrouter
 
@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -343,7 +344,14 @@ type AddIPRules struct{}
 // about the priority number. We could just do this in response to any netlink
 // change. Filtering by known priority ranges cuts back on some logspam.
 func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
-	if int(priority) < r.ipPolicyPrefBase || int(priority) >= (r.ipPolicyPrefBase+100) {
+	ownedPriority := int(priority) >= r.ipPolicyPrefBase && int(priority) < r.ipPolicyPrefBase+100
+	if runtime.GOOS == "android" {
+		ownedPriority = false
+		for _, rule := range androidIPRules() {
+			ownedPriority = ownedPriority || int(priority) == r.ipPolicyPrefBase+rule.Priority
+		}
+	}
+	if !ownedPriority {
 		// Not our rule.
 		return
 	}
@@ -587,6 +595,8 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	}
 
 	// Issue 11405: enable IP forwarding on gokrazy.
+
+	// Also enable IP forwarding on Android.
 	advertisingRoutes := len(cfg.SubnetRoutes) > 0
 	if getDistroFunc() == distro.Gokrazy && advertisingRoutes {
 		r.enableIPForwarding()
@@ -1646,11 +1656,34 @@ var ubntIPRules = []netlink.Rule{
 	},
 }
 
+// androidIPRules leaves Android's per-network tables and VPN UID policy intact.
+// Tailnet addresses take precedence over a normal VPN; other Tailscale routes
+// are a fallback after secure VPN rules. The daemon's protected sockets never
+// enter table 52, including when an exit node installs default routes there.
+func androidIPRules() []netlink.Rule {
+	return []netlink.Rule{
+		{Priority: 7300, Dst: netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")), Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
+		{Priority: 7300, Dst: netipx.PrefixIPNet(netip.MustParsePrefix("fd7a:115c:a1e0::/48")), Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
+		{Priority: 7801, Invert: true, Mark: tsconst.LinuxBypassMarkNum, Table: tailscaleRouteTable.Num},
+	}
+}
+
+// ruleMatchesFamily prevents IPv4 prefixes being replayed in the IPv6 pass
+// (and vice versa). Destination-less rules apply to both families.
+func ruleMatchesFamily(rule netlink.Rule, family int) bool {
+	if rule.Dst == nil {
+		return true
+	}
+	return (rule.Dst.IP.To4() != nil) == (family == unix.AF_INET)
+}
+
 // ipRules returns the appropriate list of ip rules to be used by Tailscale. See
 // comments on baseIPRules and ubntIPRules for more details.
 func ipRules() []netlink.Rule {
 	if getDistroFunc() == distro.UBNT {
 		return ubntIPRules
+	} else if runtime.GOOS == "android" {
+		return androidIPRules()
 	}
 	return baseIPRules
 }
@@ -1666,6 +1699,9 @@ func (r *linuxRouter) justAddIPRules() error {
 	var errAcc error
 	for _, family := range r.addrFamilies() {
 		for _, ru := range ipRules() {
+			if !ruleMatchesFamily(ru, family.netlinkInt()) {
+				continue
+			}
 			// Note: r is a value type here; safe to mutate it.
 			ru.Family = family.netlinkInt()
 			if ru.Mark != 0 {
@@ -1695,12 +1731,21 @@ func (r *linuxRouter) addIPRulesWithIPCommand() error {
 
 	for _, family := range r.addrFamilies() {
 		for _, rule := range ipRules() {
+			if !ruleMatchesFamily(rule, family.netlinkInt()) {
+				continue
+			}
 			args := []string{
 				"ip", family.dashArg(),
 				"rule", "add",
 				"pref", strconv.Itoa(rule.Priority + r.ipPolicyPrefBase),
 			}
-			if rule.Mark != 0 {
+			if rule.Invert {
+				args = append(args, "not")
+			}
+			if rule.Dst != nil {
+				args = append(args, "to", rule.Dst.String())
+			}
+			if rule.Mark != 0 || rule.Mask > 0 {
 				if r.fwmaskWorks() {
 					args = append(args, "fwmark", fmt.Sprintf("0x%x/%s", rule.Mark, tsconst.LinuxFwmarkMask))
 				} else {
@@ -1743,6 +1788,9 @@ func (r *linuxRouter) delIPRules() error {
 	var errAcc error
 	for _, family := range r.addrFamilies() {
 		for _, ru := range ipRules() {
+			if !ruleMatchesFamily(ru, family.netlinkInt()) {
+				continue
+			}
 			// Note: r is a value type here; safe to mutate it.
 			// When deleting rules, we want to be a bit specific (mention which
 			// table we were routing to) but not *too* specific (fwmarks, etc).
@@ -1750,8 +1798,12 @@ func (r *linuxRouter) delIPRules() error {
 			// versions without having ongoing hacks for every possible
 			// combination.
 			ru.Family = family.netlinkInt()
-			ru.Mark = -1
-			ru.Mask = -1
+			if runtime.GOOS == "android" {
+				ru.Mask = tsconst.LinuxFwmarkMaskNum
+			} else {
+				ru.Mark = -1
+				ru.Mask = -1
+			}
 			ru.Goto = -1
 			ru.SuppressIfgroup = -1
 			ru.SuppressPrefixlen = -1
@@ -1786,10 +1838,24 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
 		// versions without having ongoing hacks for every possible
 		// combination.
 		for _, rule := range ipRules() {
+			if !ruleMatchesFamily(rule, family.netlinkInt()) {
+				continue
+			}
 			args := []string{
 				"ip", family.dashArg(),
 				"rule", "del",
 				"pref", strconv.Itoa(rule.Priority + r.ipPolicyPrefBase),
+			}
+			if runtime.GOOS == "android" {
+				if rule.Invert {
+					args = append(args, "not")
+				}
+				if rule.Dst != nil {
+					args = append(args, "to", rule.Dst.String())
+				}
+				if rule.Mark != 0 || rule.Mask > 0 {
+					args = append(args, "fwmark", fmt.Sprintf("0x%x/%s", rule.Mark, tsconst.LinuxFwmarkMask))
+				}
 			}
 			if rule.Table != 0 {
 				args = append(args, "table", mustRouteTable(rule.Table).ipCmdArg())
