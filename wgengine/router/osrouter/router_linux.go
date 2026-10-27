@@ -343,7 +343,7 @@ type AddIPRules struct{}
 // Note that we don't care about the table number. We don't strictly even care
 // about the priority number. We could just do this in response to any netlink
 // change. Filtering by known priority ranges cuts back on some logspam.
-func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
+func (r *linuxRouter) onIPRuleDeleted(table uint32, priority uint32) {
 	ownedPriority := int(priority) >= r.ipPolicyPrefBase && int(priority) < r.ipPolicyPrefBase+100
 	if runtime.GOOS == "android" {
 		ownedPriority = false

@@ -6,6 +6,7 @@
 package netmon
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"time"
@@ -32,7 +33,7 @@ func (unspecifiedMessage) ignore() bool { return false }
 // was deleted.
 type RuleDeleted struct {
 	// Table is the table number that the deleted rule referenced.
-	Table uint8
+	Table uint32
 	// Priority is the lookup priority of the deleted rule.
 	Priority uint32
 }
@@ -56,15 +57,50 @@ type nlConn struct {
 	addrCache map[uint32]map[netip.Addr]bool
 }
 
+// The legacy RTMGRP_* bitmap has no exported IPV6_RULE constant in
+// x/sys/unix. RTNLGRP_* are one-based group IDs; convert the IPv6 rule
+// group to its bitmap bit as defined by Linux UAPI linux/rtnetlink.h.
+const linuxNetlinkGroups = unix.RTMGRP_IPV4_IFADDR | unix.RTMGRP_IPV6_IFADDR |
+	unix.RTMGRP_IPV4_ROUTE | unix.RTMGRP_IPV6_ROUTE |
+	unix.RTMGRP_IPV4_RULE | (1 << (unix.RTNLGRP_IPV6_RULE - 1))
+
+// parseDeletedRule decodes a fib_rule_hdr, which shares its 12-byte size
+// with rtmsg but has FRA_* attributes rather than RTA_* attributes. In
+// particular, FRA_UID_RANGE (20) is eight bytes, whereas route attribute
+// 20 is RTA_PREF and expects one byte. Ignore attributes we don't need.
+func parseDeletedRule(data []byte) (RuleDeleted, error) {
+	const fibRuleHeaderSize = 12
+	if len(data) < fibRuleHeaderSize {
+		return RuleDeleted{}, fmt.Errorf("short fib_rule_hdr: got %d bytes", len(data))
+	}
+	rd := RuleDeleted{Table: uint32(data[4])}
+	ad, err := netlink.NewAttributeDecoder(data[fibRuleHeaderSize:])
+	if err != nil {
+		return RuleDeleted{}, err
+	}
+	for ad.Next() {
+		switch ad.Type() {
+		case unix.FRA_PRIORITY:
+			rd.Priority = ad.Uint32()
+		case unix.FRA_TABLE:
+			// FRA_TABLE overrides the header's one-byte table value, including
+			// Android per-network routing tables whose indices exceed 255.
+			rd.Table = ad.Uint32()
+		}
+	}
+	if err := ad.Err(); err != nil {
+		return RuleDeleted{}, err
+	}
+	return rd, nil
+}
+
 func newOSMon(bus *eventbus.Bus, logf logger.Logf, m *Monitor) (osMon, error) {
 	conn, err := netlink.Dial(unix.NETLINK_ROUTE, &netlink.Config{
 		// Routes get us most of the events of interest, but we need
 		// address as well to cover things like DHCP deciding to give
 		// us a new address upon renewal - routing wouldn't change,
 		// but all reachability would.
-		Groups: unix.RTMGRP_IPV4_IFADDR | unix.RTMGRP_IPV6_IFADDR |
-			unix.RTMGRP_IPV4_ROUTE | unix.RTMGRP_IPV6_ROUTE |
-			unix.RTMGRP_IPV4_RULE, // no IPV6_RULE in x/sys/unix
+		Groups: linuxNetlinkGroups,
 	})
 	if err != nil {
 		// Google Cloud Run does not implement NETLINK_ROUTE RTMGRP support
@@ -230,18 +266,10 @@ func (c *nlConn) Receive() (message, error) {
 	case unix.RTM_DELRULE:
 		// For https://github.com/tailscale/tailscale/issues/1591 where
 		// systemd-networkd deletes our rules.
-		var rmsg rtnetlink.RouteMessage
-		err := rmsg.UnmarshalBinary(msg.Data)
+		rd, err := parseDeletedRule(msg.Data)
 		if err != nil {
 			c.logf("ip rule deleted; failed to parse netlink message: %v", err)
-		} else {
-			c.logf("ip rule deleted: %+v", rmsg)
-			// On `ip -4 rule del pref 5210 table main`, logs:
-			// monitor: ip rule deleted: {Family:2 DstLength:0 SrcLength:0 Tos:0 Table:254 Protocol:0 Scope:0 Type:1 Flags:0 Attributes:{Dst:<nil> Src:<nil> Gateway:<nil> OutIface:0 Priority:5210 Table:254 Mark:4294967295 Expires:<nil> Metrics:<nil> Multipath:[]}}
-		}
-		rd := RuleDeleted{
-			Table:    rmsg.Table,
-			Priority: rmsg.Attributes.Priority,
+			return ignoreMessage{}, nil
 		}
 		c.rulesDeleted.Publish(rd)
 		if debugNetlinkMessages() {
