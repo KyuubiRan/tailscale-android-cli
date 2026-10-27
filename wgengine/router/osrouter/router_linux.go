@@ -1664,8 +1664,17 @@ func androidIPRules() []netlink.Rule {
 	return []netlink.Rule{
 		{Priority: 7300, Dst: netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")), Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
 		{Priority: 7300, Dst: netipx.PrefixIPNet(netip.MustParsePrefix("fd7a:115c:a1e0::/48")), Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
-		{Priority: 7801, Invert: true, Mark: tsconst.LinuxBypassMarkNum, Table: tailscaleRouteTable.Num},
+		{Priority: 7801, Invert: true, Mark: tsconst.LinuxBypassMarkNum & tsconst.LinuxFwmarkMaskNum, Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
 	}
+}
+
+// ruleMask uses an explicit predicate mask when present. Linux's historical
+// rules leave it unset and use the package firewall mark allocation.
+func ruleMask(rule netlink.Rule) int {
+	if rule.Mask > 0 {
+		return rule.Mask
+	}
+	return tsconst.LinuxFwmarkMaskNum
 }
 
 // ruleMatchesFamily prevents IPv4 prefixes being replayed in the IPv6 pass
@@ -1747,7 +1756,7 @@ func (r *linuxRouter) addIPRulesWithIPCommand() error {
 			}
 			if rule.Mark != 0 || rule.Mask > 0 {
 				if r.fwmaskWorks() {
-					args = append(args, "fwmark", fmt.Sprintf("0x%x/%s", rule.Mark, tsconst.LinuxFwmarkMask))
+					args = append(args, "fwmark", fmt.Sprintf("0x%x/0x%x", rule.Mark, ruleMask(rule)))
 				} else {
 					args = append(args, "fwmark", fmt.Sprintf("0x%x", rule.Mark))
 				}
@@ -1854,7 +1863,7 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
 					args = append(args, "to", rule.Dst.String())
 				}
 				if rule.Mark != 0 || rule.Mask > 0 {
-					args = append(args, "fwmark", fmt.Sprintf("0x%x/%s", rule.Mark, tsconst.LinuxFwmarkMask))
+					args = append(args, "fwmark", fmt.Sprintf("0x%x/0x%x", rule.Mark, ruleMask(rule)))
 				}
 			}
 			if rule.Table != 0 {
