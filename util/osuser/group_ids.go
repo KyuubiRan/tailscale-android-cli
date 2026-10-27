@@ -19,6 +19,23 @@ import (
 // an error. It will first try to use the 'id' command to get the group IDs,
 // and if that fails, it will fall back to the user.GroupIds method.
 func GetGroupIds(user *user.User) ([]string, error) {
+	if runtime.GOOS == "android" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if user.Username == "" || strings.HasPrefix(user.Username, "-") {
+			return nil, fmt.Errorf("invalid Android username")
+		}
+		out, err := exec.CommandContext(ctx, "/system/bin/id", "-G", user.Username).Output()
+		if err != nil {
+			return nil, fmt.Errorf("Android groups for %q: %w", user.Username, err)
+		}
+		groups := strings.Fields(string(out))
+		if len(groups) == 0 {
+			return nil, fmt.Errorf("no Android groups for %q", user.Username)
+		}
+		return groups, nil
+	}
+
 	if runtime.GOOS == "plan9" {
 		return nil, nil
 	}

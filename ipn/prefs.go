@@ -753,6 +753,14 @@ func NewPrefs() *Prefs {
 			Apply: opt.Bool("unset"),
 		},
 	}
+	if runtime.GOOS == "android" {
+		// Root mode coexists with netd and a separate VpnService. Neither DNS
+		// nor Android firewall policy should change during first startup.
+		p.CorpDNS = false
+		p.NetfilterMode = preftype.NetfilterOff
+		p.AutoUpdate.Check = false
+		p.AutoUpdate.Apply = opt.NewBool(false)
+	}
 	p.RouteAll = p.DefaultRouteAll(runtime.GOOS)
 	return p
 }
