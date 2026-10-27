@@ -201,7 +201,6 @@ type proxyStartFunc = func(logf logger.Logf, dialer *tsdial.Dialer)
 
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
-
 	if shouldRunCLI() {
 		beCLI()
 		return
