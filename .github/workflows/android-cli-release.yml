@@ -1,0 +1,114 @@
+name: Android CLI release
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-cli-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.repository == 'KyuubiRan/tailscale-android-cli' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the Go version from go.mod
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build Android ARM64 package with the installed NDK
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$sdk" ]]; then
+            echo 'The hosted runner has no configured Android SDK.' >&2
+            exit 1
+          fi
+          export ANDROID_NDK_HOME="$sdk/ndk/30.0.16248370"
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+          if [[ ! -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android23-clang" ]]; then
+            echo 'The hosted runner is missing the pinned, preinstalled NDK 30.0.16248370; automatic SDK downloads are disabled.' >&2
+            exit 1
+          fi
+          channel=prerelease
+          if [[ "$GITHUB_REF_NAME" == main ]]; then channel=stable; fi
+          python3 scripts/build-android-cli.py \
+            --revision "$GITHUB_RUN_NUMBER" \
+            --release-channel "$channel" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish complete release assets
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PACKAGE: ${{ steps.build.outputs.package }}
+          MANIFEST: ${{ steps.build.outputs.manifest }}
+          CHECKSUM: ${{ steps.build.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          python3 scripts/publish-android-cli.py \
+            --package "$PACKAGE" --manifest "$MANIFEST" --checksum "$CHECKSUM" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Check module sync configuration
+        shell: bash
+        env:
+          SYNC_KEY: ${{ secrets.SHELLSCALED_SYNC_KEY }}
+          RELEASE_AUTHOR_NAME: ${{ vars.RELEASE_AUTHOR_NAME }}
+          RELEASE_AUTHOR_EMAIL: ${{ vars.RELEASE_AUTHOR_EMAIL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SYNC_KEY" ]]; then
+            echo 'CLI release published, but module sync requires the dedicated SHELLSCALED_SYNC_KEY deploy-key secret.' >&2
+            exit 1
+          fi
+          if [[ -z "$RELEASE_AUTHOR_NAME" || -z "$RELEASE_AUTHOR_EMAIL" ]]; then
+            echo 'CLI release published, but module sync requires RELEASE_AUTHOR_NAME and RELEASE_AUTHOR_EMAIL repository variables.' >&2
+            exit 1
+          fi
+
+      - name: Check out the matching module branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KyuubiRan/Shellscaled
+          ref: ${{ github.ref_name }}
+          path: module-sync
+          fetch-depth: 0
+          submodules: false
+          ssh-key: ${{ secrets.SHELLSCALED_SYNC_KEY }}
+          persist-credentials: true
+
+      - name: Sync the CLI release into the module
+        working-directory: module-sync
+        shell: bash
+        env:
+          MANIFEST: ${{ steps.publish.outputs.manifest }}
+          CLI_TAG: ${{ steps.publish.outputs.tag }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+          RELEASE_AUTHOR_NAME: ${{ vars.RELEASE_AUTHOR_NAME }}
+          RELEASE_AUTHOR_EMAIL: ${{ vars.RELEASE_AUTHOR_EMAIL }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-release.py sync --manifest "$MANIFEST" --cli-tag "$CLI_TAG" --branch "$TARGET_BRANCH"
+          git push origin "HEAD:$TARGET_BRANCH"
