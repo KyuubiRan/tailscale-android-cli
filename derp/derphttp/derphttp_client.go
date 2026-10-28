@@ -475,7 +475,14 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	var serverProtoVersion int
 	var tlsState *tls.ConnectionState
 	if c.useHTTPS() {
-		tlsConn := c.tlsClient(tcpConn, node)
+		// Android's address-family race includes TLS, so a TCP-only IPv6
+		// path cannot prevent a healthy IPv4 relay from being tried.
+		var tlsConn *tls.Conn
+		if ready, ok := tcpConn.(*handshakenTLSConn); ok {
+			tlsConn = ready.Conn
+		} else {
+			tlsConn = c.tlsClient(tcpConn, node)
+		}
 		httpConn = tlsConn
 
 		// Force a handshake now (instead of waiting for it to
@@ -634,9 +641,9 @@ func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
 	return tcpConn, nil
 }
 
-// dialRegion returns a TCP connection to the provided region, trying
-// each node in order (with dialNode) until one connects or ctx is
-// done.
+// dialRegion returns a connection to the provided region, trying each node
+// in order (with dialNode) until one connects or ctx is done. On Android,
+// HTTPS connections have already completed TLS when returned.
 func (c *Client) dialRegion(ctx context.Context, reg *tailcfg.DERPRegion) (net.Conn, *tailcfg.DERPNode, error) {
 	if len(reg.Nodes) == 0 {
 		return nil, nil, fmt.Errorf("no nodes for %s", c.targetString(reg))
@@ -684,8 +691,8 @@ func (c *Client) tlsClient(nc net.Conn, node *tailcfg.DERPNode) *tls.Conn {
 // DialRegionTLS returns a TLS connection to a DERP node in the given region.
 //
 // DERP nodes for a region are tried in sequence according to their order
-// in the DERP map. TLS is initiated on the first node where a socket is
-// established.
+// in the DERP map. On Android, address families race through the TLS handshake;
+// elsewhere TLS is initiated on the first node where a socket is established.
 func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tlsConn *tls.Conn, connClose io.Closer, node *tailcfg.DERPNode, err error) {
 	tcpConn, node, err := c.dialRegion(ctx, reg)
 	if err != nil {
@@ -694,7 +701,11 @@ func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tl
 	done := make(chan bool) // unbuffered
 	defer close(done)
 
-	tlsConn = c.tlsClient(tcpConn, node)
+	if ready, ok := tcpConn.(*handshakenTLSConn); ok {
+		tlsConn = ready.Conn
+	} else {
+		tlsConn = c.tlsClient(tcpConn, node)
+	}
 	go func() {
 		select {
 		case <-done:
@@ -732,9 +743,14 @@ func shouldDialProto(s string, pred func(netip.Addr) bool) bool {
 
 const dialNodeTimeout = 1500 * time.Millisecond
 
-// dialNode returns a TCP connection to node n, racing IPv4 and IPv6
-// (both as applicable) against each other.
-// A node is only given dialNodeTimeout to connect.
+// handshakenTLSConn identifies TLS completed by our family race. An arbitrary
+// *tls.Conn may instead be the outer connection to an HTTPS CONNECT proxy,
+// which still needs its own inner TLS handshake with the DERP server.
+type handshakenTLSConn struct{ *tls.Conn }
+
+// dialNode returns a connection to node n, racing IPv4 and IPv6 (both as
+// applicable) against each other. Android HTTPS races include the TLS handshake.
+// Each TCP dial is only given dialNodeTimeout to connect.
 //
 // TODO(bradfitz): longer if no options remain perhaps? ...  Or longer
 // overall but have dialRegion start overlapping races?
@@ -761,7 +777,17 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 		err error
 	}
 	resc := make(chan res) // must be unbuffered
-	ctx, cancel := context.WithTimeout(ctx, dialNodeTimeout)
+	// A successful IPv6 TCP connect does not prove TLS is usable. In
+	// Android root mode an already-active VPN can change which family
+	// wins the initial TCP race. Race complete TLS handshakes so a
+	// stalled IPv6 relay does not starve the same node's working IPv4
+	// endpoint. Preserve the existing certificate validation in tlsClient.
+	raceTLS := runtime.GOOS == "android" && c.useHTTPS()
+	raceTimeout := dialNodeTimeout
+	if raceTLS {
+		raceTimeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, raceTimeout)
 	defer cancel()
 
 	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDERPHTTPClient, c.logf)
@@ -800,12 +826,26 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			if n.DERPPort != 0 {
 				port = fmt.Sprint(n.DERPPort)
 			}
-			c, err := c.dialContext(ctx, proto, net.JoinHostPort(dst, port))
+			dialCtx := ctx
+			cancelDial := func() {}
+			if raceTLS {
+				dialCtx, cancelDial = context.WithTimeout(ctx, dialNodeTimeout)
+			}
+			conn, err := c.dialContext(dialCtx, proto, net.JoinHostPort(dst, port))
+			cancelDial()
+			if err == nil && raceTLS {
+				tlsConn := c.tlsClient(conn, n)
+				if err = tlsConn.HandshakeContext(ctx); err != nil {
+					conn.Close()
+				} else {
+					conn = &handshakenTLSConn{tlsConn}
+				}
+			}
 			select {
-			case resc <- res{c, err}:
+			case resc <- res{conn, err}:
 			case <-ctx.Done():
-				if c != nil {
-					c.Close()
+				if conn != nil {
+					conn.Close()
 				}
 			}
 		}()
