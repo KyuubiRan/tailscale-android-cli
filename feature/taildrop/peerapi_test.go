@@ -97,7 +97,7 @@ func bodyContains(sub string) check {
 
 func fileHasSize(name string, size int) check {
 	return func(t *testing.T, e *peerAPITestEnv) {
-		fsImpl, ok := e.taildrop.opts.fileOps.(*fsFileOps)
+		fsImpl, ok := e.taildrop.opts.fileOps.(fsFileOps)
 		if !ok {
 			t.Skip("fileHasSize only supported on fsFileOps backend")
 			return
@@ -122,7 +122,7 @@ func fileHasSize(name string, size int) check {
 
 func fileHasContents(name string, want string) check {
 	return func(t *testing.T, e *peerAPITestEnv) {
-		fsImpl, ok := e.taildrop.opts.fileOps.(*fsFileOps)
+		fsImpl, ok := e.taildrop.opts.fileOps.(fsFileOps)
 		if !ok {
 			t.Skip("fileHasContents only supported on fsFileOps backend")
 			return
