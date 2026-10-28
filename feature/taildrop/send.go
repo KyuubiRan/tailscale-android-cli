@@ -85,43 +85,41 @@ func (m *manager) PutFile(id clientID, baseName string, r io.Reader, offset, len
 		return 0, err
 	}
 
-	// and make sure we don't delete it while uploading:
-	m.deleter.Remove(baseName)
-
-	// Create (if not already) the partial file with read-write permissions.
-	partialName := baseName + id.partialSuffix()
-	wc, partialPath, err := m.opts.fileOps.OpenWriter(partialName, offset, 0o666)
-	if err != nil {
-		return 0, m.redactAndLogError("Create", err)
-	}
-	defer func() {
-		wc.Close()
-		if err != nil {
-			m.deleter.Insert(partialName) // mark partial file for eventual deletion
-		}
-	}()
-
-	// Check whether there is an in-progress transfer for the file.
+	// Reserve this transfer before opening its partial file: OpenWriter may
+	// truncate it, so even a rejected duplicate must never reach that operation.
 	inFileKey := incomingFileKey{id, baseName}
 	inFile, loaded := m.incomingFiles.LoadOrInit(inFileKey, func() *incomingFile {
-		inFile := &incomingFile{
+		return &incomingFile{
 			clock:          m.opts.Clock,
 			started:        m.opts.Clock.Now(),
 			size:           length,
 			sendFileNotify: m.opts.SendFileNotify,
 		}
-		if m.opts.DirectFileMode {
-			inFile.partialPath = partialPath
-		}
-		return inFile
 	})
-
-	inFile.w = wc
-
 	if loaded {
 		return 0, ErrFileExists
 	}
 	defer m.incomingFiles.Delete(inFileKey)
+
+	partialName := baseName + id.partialSuffix()
+	// Remove the same partial-file key queued by an earlier failed attempt.
+	m.deleter.Remove(partialName)
+	defer func() {
+		if err != nil {
+			m.deleter.Insert(partialName) // mark partial file for eventual deletion
+		}
+	}()
+	wc, partialPath, err := m.opts.fileOps.OpenWriter(partialName, offset, 0o666)
+	if err != nil {
+		return 0, m.redactAndLogError("Create", err)
+	}
+	defer wc.Close()
+	inFile.w = wc
+	inFile.mu.Lock()
+	if m.opts.DirectFileMode {
+		inFile.partialPath = partialPath
+	}
+	inFile.mu.Unlock()
 
 	// Record that we have started to receive at least one file.
 	// This is used by the deleter upon a cold-start to scan the directory
@@ -148,16 +146,15 @@ func (m *manager) PutFile(id clientID, baseName string, r io.Reader, offset, len
 
 	fileLength = offset + copyLength
 
-	inFile.mu.Lock()
-	inFile.done = true
-	inFile.mu.Unlock()
-
 	// 6) Finalize (rename/move) the partial into place via FileOps.Rename
 	finalPath, err := m.opts.fileOps.Rename(partialPath, baseName)
 	if err != nil {
 		return 0, m.redactAndLogError("Rename", err)
 	}
+	inFile.mu.Lock()
 	inFile.finalPath = finalPath
+	inFile.done = true
+	inFile.mu.Unlock()
 
 	m.totalReceived.Add(1)
 	m.opts.SendFileNotify()

@@ -62,10 +62,12 @@ func (f fsFileOps) OpenWriter(name string, offset int64, perm os.FileMode) (io.W
 			fi.Close()
 			return nil, "", err
 		}
-		if err := fi.Truncate(offset); err != nil {
-			fi.Close()
-			return nil, "", err
-		}
+	}
+	// A retry from byte zero must discard an interrupted upload's old suffix,
+	// just as a resumed upload discards everything after its confirmed prefix.
+	if err := fi.Truncate(offset); err != nil {
+		fi.Close()
+		return nil, "", err
 	}
 	return fi, path, nil
 }
