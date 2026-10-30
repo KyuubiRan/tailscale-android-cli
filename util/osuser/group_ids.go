@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"os/user"
 	"runtime"
 	"strings"
