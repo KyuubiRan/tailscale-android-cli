@@ -4020,6 +4020,13 @@ func (b *LocalBackend) DebugForceNetmapUpdate() {
 	b.setNetMapLocked(nm)
 }
 
+// DebugReconfig recomputes the engine, router and DNS configuration from
+// current state and applies it if it changed. Shellscaled calls it after
+// changing [exitNodeIPv6LocalFile].
+func (b *LocalBackend) DebugReconfig() {
+	b.authReconfig()
+}
+
 // DebugPickNewDERP forwards to magicsock.Conn.DebugPickNewDERP.
 // See its docs.
 func (b *LocalBackend) DebugPickNewDERP() error {
@@ -6634,10 +6641,13 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 				break
 			}
 		}
+		exitIPv6 := exitNodeTakesIPv6()
 		if !default4 {
 			rs.Routes = append(rs.Routes, tsaddr.AllIPv4())
 		}
-		if !default6 {
+		if !exitIPv6 {
+			rs.Routes = withoutIPv6Default(rs.Routes)
+		} else if !default6 {
 			rs.Routes = append(rs.Routes, tsaddr.AllIPv6())
 		}
 		internalIPs, externalIPs, err := internalAndExternalInterfaces()
@@ -6652,9 +6662,9 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 			} else {
 				// Explicitly add routes to the local network so that we do not
 				// leak any traffic.
-				rs.Routes = append(rs.Routes, externalIPs...)
+				rs.Routes = append(rs.Routes, exitLeakRoutes(externalIPs, exitIPv6)...)
 			}
-			b.logf("allowing exit node access to local IPs: %v", rs.LocalRoutes)
+			b.logf("allowing exit node access to local IPs: %v (exit IPv6: %v)", rs.LocalRoutes, exitIPv6)
 		default:
 			if prefs.ExitNodeAllowLANAccess() {
 				b.logf("warning: ExitNodeAllowLANAccess has no effect on " + runtime.GOOS)
