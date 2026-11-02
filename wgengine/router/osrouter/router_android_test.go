@@ -8,6 +8,7 @@ package osrouter
 import (
 	"net/netip"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -209,9 +210,7 @@ func TestAndroidRuleFamilies(t *testing.T) {
 //
 //	SHELLSCALED_NETLINK_TEST=1 ./osrouter.test -test.run AndroidNetlink
 func TestAndroidNetlinkRules(t *testing.T) {
-	if os.Getenv("SHELLSCALED_NETLINK_TEST") != "1" {
-		t.Skip("set SHELLSCALED_NETLINK_TEST=1 in a disposable network namespace")
-	}
+	requireAndroidScratchNetNS(t)
 	r, _ := newAndroidCommandRouter(t)
 	r.cmd = osCommandRunner{}
 	if r.useIPCommand() {
@@ -281,6 +280,160 @@ func TestAndroidNetlinkRules(t *testing.T) {
 		if left := owned(f); len(left) != 0 {
 			t.Errorf("family %d: rules left after delIPRules: %+v", f, left)
 		}
+	}
+}
+
+func requireAndroidScratchNetNS(t *testing.T) {
+	t.Helper()
+	if os.Getenv("SHELLSCALED_NETLINK_TEST") != "1" {
+		t.Skip("set SHELLSCALED_NETLINK_TEST=1 in a disposable network namespace")
+	}
+	current, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := os.Readlink("/proc/1/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == initial {
+		t.Fatal("refusing to change Android's initial network namespace")
+	}
+}
+
+func TestAndroidNetlinkPreservesForeignRules(t *testing.T) {
+	requireAndroidScratchNetNS(t)
+	r, _ := newAndroidCommandRouter(t)
+	r.cmd = osCommandRunner{}
+	if r.useIPCommand() {
+		t.Fatal("netlink path not selected")
+	}
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		for _, table := range []int{1003, tailscaleRouteTable.Num} {
+			foreign := netlink.NewRule()
+			foreign.Family, foreign.Priority = family, 13001
+			foreign.Table, foreign.Mark, foreign.Mask = table, 0, 0x10000
+			if err := netlink.RuleAdd(foreign); err != nil {
+				t.Fatalf("add foreign rule: %v", err)
+			}
+			t.Cleanup(func() { _ = netlink.RuleDel(foreign) })
+			check := func() {
+				t.Helper()
+				rules, err := netlink.RuleList(family)
+				if err != nil {
+					t.Fatal(err)
+				}
+				count := 0
+				for _, rule := range rules {
+					if rule.Priority == foreign.Priority && rule.Table == table &&
+						max(rule.Mark, 0) == 0 && rule.Mask == foreign.Mask && !rule.Invert {
+						count++
+					}
+				}
+				if count != 1 {
+					t.Fatalf("family %d table %d: foreign rule count = %d, want 1", family, table, count)
+				}
+			}
+			for range 2 {
+				if err := r.addIPRules(); err != nil {
+					t.Fatal(err)
+				}
+				check()
+			}
+			if err := r.delIPRules(); err != nil {
+				t.Fatal(err)
+			}
+			check()
+		}
+	}
+}
+
+// Exercise the actual Android kernel FIB with representative Android 17 netd
+// rules. This is an isolated policy test, not a VpnService or delivery test.
+func TestAndroidNetlinkRouteSelection(t *testing.T) {
+	requireAndroidScratchNetNS(t)
+	ip := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("/system/bin/ip", args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("ip %v: %v: %s", args, err, out)
+		}
+		return string(out)
+	}
+	for i, name := range []string{"sc_phys", "sc_ts", "sc_vpn"} {
+		ip("link", "add", name, "type", "dummy")
+		t.Cleanup(func() {
+			if out, err := exec.Command("/system/bin/ip", "link", "del", name).CombinedOutput(); err != nil {
+				t.Errorf("delete fixture link %s: %v: %s", name, err, out)
+			}
+		})
+		ip("link", "set", name, "up")
+		ip("-4", "addr", "add", []string{"192.0.2.2/32", "100.127.255.252/32", "198.18.0.2/32"}[i], "dev", name)
+		ip("-6", "addr", "add", []string{"2001:db8:1::2/128", "fd7a:115c:a1e0:ffff::1/128", "2001:db8:2::2/128"}[i], "dev", name, "nodad")
+	}
+	ip("link", "set", "lo", "up")
+	for _, family := range []string{"-4", "-6"} {
+		ip(family, "route", "add", "default", "dev", "sc_phys", "table", "main")
+		ip(family, "route", "add", "default", "dev", "sc_ts", "table", "52")
+		ip(family, "route", "add", "default", "dev", "sc_vpn", "table", "1004")
+	}
+	ip("-6", "route", "add", "fd7a:115c:a1e0::/48", "dev", "sc_ts", "table", "52")
+	r, _ := newAndroidCommandRouter(t)
+	r.cmd = osCommandRunner{}
+	if r.useIPCommand() {
+		t.Fatal("netlink path not selected")
+	}
+	t.Cleanup(func() {
+		if err := r.delIPRules(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := r.addIPRules(); err != nil {
+		t.Fatal(err)
+	}
+	check := func(dst, mark, uid, want string) {
+		t.Helper()
+		family := "-4"
+		if strings.Contains(dst, ":") {
+			family = "-6"
+		}
+		out := ip(family, "route", "get", dst, "mark", mark, "uid", uid)
+		if !strings.Contains(out, "dev "+want+" ") {
+			t.Fatalf("dst %s mark %s uid %s: %s; want device %s", dst, mark, uid, out, want)
+		}
+	}
+	for _, dst := range []string{"203.0.113.1", "2001:db8:3::1"} {
+		check(dst, "0", "10000", "sc_ts")
+		check(dst, "0x64", "10000", "sc_ts")
+		check(dst, "0xc0064", "10000", "sc_ts")
+		check(dst, "0x10064", "10000", "sc_phys")
+		check(dst, "0x20064", "10000", "sc_phys")
+		check(dst, "0x10020064", "10000", "sc_phys")
+	}
+	// Removing the exit default preserves the more specific tailnet route.
+	ip("-6", "route", "del", "default", "table", "52")
+	check("2001:db8:3::1", "0x64", "10000", "sc_phys")
+	check("fd7a:115c:a1e0::1234", "0x64", "10000", "sc_ts")
+	check("203.0.113.1", "0x64", "10000", "sc_ts")
+	ip("-6", "route", "add", "default", "dev", "sc_ts", "table", "52")
+	// A secure VPN checks protectedFromVpn, UID and iif lo; explicit
+	// binding alone does not bypass it, unlike a bypassable Android VPN.
+	for _, family := range []string{"-4", "-6"} {
+		ip(family, "rule", "add", "pref", "13000", "iif", "lo", "uidrange", "10000-10000", "fwmark", "0x0/0x20000", "lookup", "1004")
+		t.Cleanup(func() {
+			out, err := exec.Command("/system/bin/ip", family, "rule", "del", "pref", "13000", "iif", "lo", "uidrange", "10000-10000", "fwmark", "0x0/0x20000", "lookup", "1004").CombinedOutput()
+			if err != nil {
+				t.Errorf("delete fixture VPN rule: %v: %s", err, out)
+			}
+		})
+	}
+	for _, dst := range []string{"203.0.113.1", "2001:db8:3::1"} {
+		check(dst, "0x64", "10000", "sc_vpn")
+		check(dst, "0x10064", "10000", "sc_vpn")
+		check(dst, "0x10000000", "10000", "sc_vpn")
+		check(dst, "0x20064", "10000", "sc_phys")
+		check(dst, "0x10020064", "10000", "sc_phys")
+		check(dst, "0x64", "10001", "sc_ts")
 	}
 }
 

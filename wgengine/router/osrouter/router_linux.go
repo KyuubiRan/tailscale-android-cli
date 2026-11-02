@@ -1658,14 +1658,18 @@ var ubntIPRules = []netlink.Rule{
 
 // androidVPNSkipMask is matched against 0 by the fallback rule. It skips
 // sockets carrying the module's own bypass bit and sockets netd marked as
-// explicitly bound to a network (bit 16) or protectedFromVpn (bit 17), the
-// same exemptions a stock Android VPN gets; all other traffic follows table 52.
+// explicitly bound to a network (bit 16) or protectedFromVpn (bit 17).
+// These are Android netd marks, not Linux's upstream firewall allocation.
+// Android's secure and bypassable VPN rules also differ in UID and interface
+// scope; this mark predicate does not reproduce their entire policy.
 const androidVPNSkipMask = (tsconst.LinuxBypassMarkNum & tsconst.LinuxFwmarkMaskNum) | 0x10000 | 0x20000
 
 // androidIPRules leaves Android's per-network tables and VPN UID policy intact.
 // Tailnet addresses take precedence over a normal VPN (12500); other
 // Tailscale routes, including an exit node's default routes, are a fallback
-// after secure VPN rules (13001). Nothing is exempted by source address: a
+// at priority 13001. Android VPN priorities can include subpriorities, so
+// this fixed priority does not establish universal VPN coexistence.
+// Nothing is exempted by source address: a
 // flow opened before an exit node was selected moves to table 52 as well, as
 // with an in-place route update of an Android VPN.
 func androidIPRules() []netlink.Rule {
