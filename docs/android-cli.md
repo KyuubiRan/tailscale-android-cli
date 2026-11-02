@@ -78,7 +78,7 @@ a running daemon, or restart it with the new setting. Existing files in the
 former direct-delivery directory remain there and are never moved automatically.
 
 Android applications that explicitly supply SAF `FileOps` retain direct mode;
-the private inbox is the daemon default, not a replacement for SAF. Android-only
+the daemon inbox opt-in does not replace SAF. Android-only
 regressions cover initial profile inbox creation, separate profiles, private
 permissions, waiting-file retrieval, and delivery through explicit FileOps.
 These synthetic tests do not establish authenticated cross-device delivery.
