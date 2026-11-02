@@ -17,6 +17,37 @@ import (
 	"tailscale.com/tstest"
 )
 
+// TestServeDebugReconfigPermissions exercises the LocalAPI endpoint without
+// a real account or network map.
+func TestServeDebugReconfigPermissions(t *testing.T) {
+	for _, tt := range []struct {
+		name, method, header string
+		write                bool
+		want                 int
+	}{
+		{"read-only", http.MethodPost, "", false, http.StatusForbidden},
+		{"get", http.MethodGet, "", true, http.StatusMethodNotAllowed},
+		{"write", http.MethodPost, "", true, http.StatusOK},
+		{"origin", http.MethodPost, "Origin", true, http.StatusForbidden},
+		{"referer", http.MethodPost, "Referer", true, http.StatusForbidden},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := handlerForTest(t, &Handler{
+				PermitRead: true, PermitWrite: tt.write, b: newTestLocalBackend(t),
+			})
+			req := httptest.NewRequest(tt.method, "http://local-tailscaled.sock/localapi/v0/debug?action=reconfig", nil)
+			if tt.header != "" {
+				req.Header.Set(tt.header, "https://example.invalid/")
+			}
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, req)
+			if resp.Code != tt.want {
+				t.Errorf("status = %d, want %d; body: %s", resp.Code, tt.want, resp.Body.String())
+			}
+		})
+	}
+}
+
 // TestServeDevSetStateStore verifies writing state keys requires a local admin,
 // not just PermitWrite; guards against bypassing serve-config's authz check.
 func TestServeDevSetStateStore(t *testing.T) {

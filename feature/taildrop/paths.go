@@ -27,10 +27,12 @@ func (e *Extension) SetFileOps(fileOps FileOps) {
 
 func (e *Extension) setPlatformDefaultDirectFileRoot() {
 	if runtime.GOOS == "android" {
-		dir := "/sdcard/Download/Taildrop"
-		if err := os.MkdirAll(dir, 0o700); err == nil {
-			e.directFileRoot = dir
-		}
+		// Modules with a receiver opt in to the profile-scoped inbox under
+		// --statedir. Binary-only updates of older modules must retain their
+		// existing direct delivery: they have nobody to drain a private inbox.
+		// The Android app explicitly supplies SAF FileOps; that still selects
+		// direct mode in onChangeProfile, independently of this default.
+		e.directFileRoot = androidDefaultDirectFileRoot(os.MkdirAll)
 		return
 	}
 
@@ -48,6 +50,18 @@ func (e *Extension) setPlatformDefaultDirectFileRoot() {
 			e.directFileRoot = path
 		}
 	}
+}
+
+func androidDefaultDirectFileRoot(mkdir func(string, os.FileMode) error) string {
+	// This is a fixed opt-in, never a caller-selected filesystem destination.
+	if os.Getenv("TS_ANDROID_TAILDROP_INBOX") == "1" {
+		return ""
+	}
+	const directory = "/sdcard/Download/Taildrop"
+	if mkdir(directory, 0o700) == nil {
+		return directory
+	}
+	return ""
 }
 
 func findTaildropDir(dg distro.Distro) (string, error) {

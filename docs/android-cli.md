@@ -21,6 +21,68 @@ Each build produces:
 
 Extract the ZIP on Android and preserve executable permissions on both files in `bin/`. The wrapper sets `TS_BE_CLI=1`; daemon arguments and `--socket` selection remain available to the caller. Account state is not bundled.
 
+## Android routing policy
+
+Shellscaled uses Android netd's socket marks in addition to its own daemon
+bypass bit. The table-52 fallback at priority 13001 matches
+`fwmark 0x0/0x10030000`, so sockets explicitly bound to a network (bit 16),
+protected from VPNs (bit 17), or carrying the daemon bypass bit do not match
+this fallback. Earlier tailnet and Android rules still apply. Android's
+resolver applies its protected DNS mark to
+both UDP and TCP sockets. This avoids pulling physical-network DNS sockets
+into an exit node merely because it advertises a default route.
+
+This is not a replacement for Android's complete VPN policy. Android 17's
+secure VPN rules match the protected bit; bypassable VPN rules also match
+the explicit-selection bit. Those rules include UID and input-interface
+restrictions, and can add subpriorities. Shellscaled retains its existing
+12500 tailnet destination rules and 13001 fallback; those fixed priorities
+do not guarantee coexistence with every secure, bypassable, lockdown or
+per-app VPN. In particular, the tailnet rules precede the Android 17 secure
+VPN base priority, and the fallback precedes its bypassable VPN priorities.
+
+Official references inspected online, without cloning AOSP:
+
+- [Android 17 socket mark fields](https://android.googlesource.com/platform/system/netd/+/android-17.0.0_r1/include/Fwmark.h).
+- [Android 17 routing priorities](https://android.googlesource.com/platform/system/netd/+/android-17.0.0_r1/server/RouteController.h) and [VPN rule predicates](https://android.googlesource.com/platform/system/netd/+/android-17.0.0_r1/server/RouteController.cpp).
+- [DNS mark selection](https://android.googlesource.com/platform/system/netd/+/android-17.0.0_r1/server/NetworkController.cpp) and [resolver socket marks](https://android.googlesource.com/platform/packages/modules/DnsResolver/+/android-17.0.0_r1/res_send.cpp).
+- [Android VPN bypass documentation](https://developer.android.com/develop/connectivity/vpn#bypass-vpn).
+
+The optional root-only file `/data/adb/shellscaled/exit-node-ipv6-local`
+keeps the exit node's IPv6 default route off the device. Its absence
+preserves upstream behaviour. Creating it deliberately leaves IPv6 internet
+traffic outside the exit node; Android's existing network and VPN policy
+still applies. Tailnet and accepted subnet routes remain.
+`POST /localapi/v0/debug?action=reconfig`
+requests route reconfiguration without restarting the daemon. Callers must
+check the resulting state rather than treating the debug response as proof
+of successful route installation.
+
+Android netlink tests require an isolated network namespace and refuse the
+initial namespace even when explicitly enabled. Emulator tests of rule
+encoding, migration and route selection do not establish authenticated
+packet delivery or general Android VPN coexistence.
+
+## Taildrop receiving
+
+Android root daemons opt in with the fixed `TS_ANDROID_TAILDROP_INBOX=1`
+environment setting when their module includes a receiver. They then use
+Taildrop's existing profile-scoped buffered inbox under `--statedir/files/`.
+Shellscaled retrieves completed files through the fixed LocalAPI and publishes
+them to the saved directory; changing that directory does not restart the daemon.
+
+Without that explicit opt-in, the daemon retains direct delivery to
+`/sdcard/Download/Taildrop`. This preserves binary-only updates of older modules
+that have no receiver. A module upgrade must verify this setting before adopting
+a running daemon, or restart it with the new setting. Existing files in the
+former direct-delivery directory remain there and are never moved automatically.
+
+Android applications that explicitly supply SAF `FileOps` retain direct mode;
+the daemon inbox opt-in does not replace SAF. Android-only
+regressions cover initial profile inbox creation, separate profiles, private
+permissions, waiting-file retrieval, and delivery through explicit FileOps.
+These synthetic tests do not establish authenticated cross-device delivery.
+
 ## Branch releases
 
 The dedicated [Android CLI workflow](../.github/workflows/android-cli-release.yml) accepts pushes to `dev` and `main`, plus manual runs on those two branches. `VERSION.txt` supplies the Tailscale version; the workflow run number supplies the package revision without a two-digit limit.
