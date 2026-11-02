@@ -1656,16 +1656,46 @@ var ubntIPRules = []netlink.Rule{
 	},
 }
 
+// androidVPNSkipMask is matched against 0 by the fallback rule. It skips
+// sockets carrying the module's own bypass bit and sockets netd marked as
+// explicitly bound to a network (bit 16) or protectedFromVpn (bit 17).
+// These are Android netd marks, not Linux's upstream firewall allocation.
+// Android's secure and bypassable VPN rules also differ in UID and interface
+// scope; this mark predicate does not reproduce their entire policy.
+const androidVPNSkipMask = (tsconst.LinuxBypassMarkNum & tsconst.LinuxFwmarkMaskNum) | 0x10000 | 0x20000
+
 // androidIPRules leaves Android's per-network tables and VPN UID policy intact.
-// Tailnet addresses take precedence over a normal VPN; other Tailscale routes
-// are a fallback after secure VPN rules. The daemon's protected sockets never
-// enter table 52, including when an exit node installs default routes there.
+// Tailnet addresses take precedence over a normal VPN (12500); other
+// Tailscale routes, including an exit node's default routes, are a fallback
+// at priority 13001. Android VPN priorities can include subpriorities, so
+// this fixed priority does not establish universal VPN coexistence.
+// Nothing is exempted by source address: a
+// flow opened before an exit node was selected moves to table 52 as well, as
+// with an in-place route update of an Android VPN.
 func androidIPRules() []netlink.Rule {
 	return []netlink.Rule{
 		{Priority: 7300, Dst: netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")), Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
 		{Priority: 7300, Dst: netipx.PrefixIPNet(netip.MustParsePrefix("fd7a:115c:a1e0::/48")), Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
+		{Priority: 7801, Mask: androidVPNSkipMask, Table: tailscaleRouteTable.Num},
+	}
+}
+
+// androidLegacyIPRules are rule shapes installed by earlier releases
+// (android-v1.104.4-r5 and earlier). They are only deleted, so an upgrade or
+// a crashed daemon does not leave the old catch-all beside the new
+// same-priority rule.
+func androidLegacyIPRules() []netlink.Rule {
+	return []netlink.Rule{
 		{Priority: 7801, Invert: true, Mark: tsconst.LinuxBypassMarkNum & tsconst.LinuxFwmarkMaskNum, Mask: tsconst.LinuxFwmarkMaskNum, Table: tailscaleRouteTable.Num},
 	}
+}
+
+// ipRulesToDelete is ipRules plus any legacy shapes this platform cleans up.
+func ipRulesToDelete() []netlink.Rule {
+	if runtime.GOOS == "android" {
+		return append(androidLegacyIPRules(), androidIPRules()...)
+	}
+	return ipRules()
 }
 
 // ruleMask uses an explicit predicate mask when present. Linux's historical
@@ -1796,7 +1826,7 @@ func (r *linuxRouter) delIPRules() error {
 	}
 	var errAcc error
 	for _, family := range r.addrFamilies() {
-		for _, ru := range ipRules() {
+		for _, ru := range ipRulesToDelete() {
 			if !ruleMatchesFamily(ru, family.netlinkInt()) {
 				continue
 			}
@@ -1807,9 +1837,9 @@ func (r *linuxRouter) delIPRules() error {
 			// versions without having ongoing hacks for every possible
 			// combination.
 			ru.Family = family.netlinkInt()
-			if runtime.GOOS == "android" {
-				ru.Mask = tsconst.LinuxFwmarkMaskNum
-			} else {
+			// Android rules keep their exact mark and mask, so the
+			// kernel tells the legacy and current 13001 rules apart.
+			if runtime.GOOS != "android" {
 				ru.Mark = -1
 				ru.Mask = -1
 			}
@@ -1846,7 +1876,7 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
 		// That leaves us some flexibility to change these values in later
 		// versions without having ongoing hacks for every possible
 		// combination.
-		for _, rule := range ipRules() {
+		for _, rule := range ipRulesToDelete() {
 			if !ruleMatchesFamily(rule, family.netlinkInt()) {
 				continue
 			}
