@@ -24,6 +24,7 @@ func (b androidInboxBackend) TailscaleVarRoot() string { return b.root }
 func (b androidInboxBackend) Clock() tstime.Clock      { return tstime.StdClock{} }
 
 func TestAndroidTaildropUsesProfileInbox(t *testing.T) {
+	t.Setenv("TS_ANDROID_TAILDROP_INBOX", "1")
 	root := t.TempDir()
 	e := &Extension{sb: androidInboxBackend{root: root}, logf: t.Logf}
 	e.setPlatformDefaultDirectFileRoot()
@@ -66,14 +67,45 @@ func TestAndroidTaildropUsesProfileInbox(t *testing.T) {
 	}
 }
 
+func TestAndroidTaildropLegacyDefault(t *testing.T) {
+	t.Setenv("TS_ANDROID_TAILDROP_INBOX", "")
+	called := false
+	root := androidDefaultDirectFileRoot(func(path string, mode os.FileMode) error {
+		called = true
+		if path != "/sdcard/Download/Taildrop" || mode != 0700 {
+			t.Fatal("legacy Android destination changed")
+		}
+		return nil // No actual shared-storage write in this fixture.
+	})
+	if !called || root != "/sdcard/Download/Taildrop" {
+		t.Fatal("a binary-only upgrade stopped legacy direct delivery")
+	}
+	t.Setenv("TS_ANDROID_TAILDROP_INBOX", "1")
+	if root := androidDefaultDirectFileRoot(func(string, os.FileMode) error {
+		t.Fatal("opted-in daemon touched shared storage")
+		return nil
+	}); root != "" {
+		t.Fatal("opt-in did not select the private inbox")
+	}
+}
+
 func TestAndroidExplicitFileOpsRemainDirect(t *testing.T) {
+	for _, mode := range []string{"", "1"} {
+		t.Run("inbox="+mode, func(t *testing.T) {
+			t.Setenv("TS_ANDROID_TAILDROP_INBOX", mode)
+			testAndroidExplicitFileOps(t)
+		})
+	}
+}
+
+func testAndroidExplicitFileOps(t *testing.T) {
 	root, safRoot := t.TempDir(), t.TempDir()
 	ops, err := newFileOps(safRoot) // Synthetic SAF-compatible FileOps; no Android provider.
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &Extension{sb: androidInboxBackend{root: root}, logf: t.Logf}
-	e.setPlatformDefaultDirectFileRoot()
+	e.directFileRoot = androidDefaultDirectFileRoot(func(string, os.FileMode) error { return nil })
 	e.SetFileOps(ops)
 	defer e.Shutdown()
 	profile := (&ipn.LoginProfile{UserProfile: tailcfg.UserProfile{ID: 43, LoginName: "saf@example.test"}}).View()

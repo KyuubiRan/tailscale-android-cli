@@ -65,13 +65,17 @@ packet delivery or general Android VPN coexistence.
 
 ## Taildrop receiving
 
-The Android daemon uses Taildrop's existing profile-scoped buffered inbox under
-`--statedir/files/`. It does not create or deliver directly to shared
-`Download/Taildrop`. Shellscaled's receiver retrieves completed files through
-the fixed LocalAPI, then publishes them to the saved shared-storage directory.
-Changing that directory therefore does not restart the daemon or change an
-in-progress peer upload. Existing files in the former direct-delivery directory
-remain there and are never moved automatically.
+Android root daemons opt in with the fixed `TS_ANDROID_TAILDROP_INBOX=1`
+environment setting when their module includes a receiver. They then use
+Taildrop's existing profile-scoped buffered inbox under `--statedir/files/`.
+Shellscaled retrieves completed files through the fixed LocalAPI and publishes
+them to the saved directory; changing that directory does not restart the daemon.
+
+Without that explicit opt-in, the daemon retains direct delivery to
+`/sdcard/Download/Taildrop`. This preserves binary-only updates of older modules
+that have no receiver. A module upgrade must verify this setting before adopting
+a running daemon, or restart it with the new setting. Existing files in the
+former direct-delivery directory remain there and are never moved automatically.
 
 Android applications that explicitly supply SAF `FileOps` retain direct mode;
 the private inbox is the daemon default, not a replacement for SAF. Android-only
