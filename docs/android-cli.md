@@ -63,6 +63,22 @@ initial namespace even when explicitly enabled. Emulator tests of rule
 encoding, migration and route selection do not establish authenticated
 packet delivery or general Android VPN coexistence.
 
+## Taildrop receiving
+
+The Android daemon uses Taildrop's existing profile-scoped buffered inbox under
+`--statedir/files/`. It does not create or deliver directly to shared
+`Download/Taildrop`. Shellscaled's receiver retrieves completed files through
+the fixed LocalAPI, then publishes them to the saved shared-storage directory.
+Changing that directory therefore does not restart the daemon or change an
+in-progress peer upload. Existing files in the former direct-delivery directory
+remain there and are never moved automatically.
+
+Android applications that explicitly supply SAF `FileOps` retain direct mode;
+the private inbox is the daemon default, not a replacement for SAF. Android-only
+regressions cover initial profile inbox creation, separate profiles, private
+permissions, waiting-file retrieval, and delivery through explicit FileOps.
+These synthetic tests do not establish authenticated cross-device delivery.
+
 ## Branch releases
 
 The dedicated [Android CLI workflow](../.github/workflows/android-cli-release.yml) accepts pushes to `dev` and `main`, plus manual runs on those two branches. `VERSION.txt` supplies the Tailscale version; the workflow run number supplies the package revision without a two-digit limit.

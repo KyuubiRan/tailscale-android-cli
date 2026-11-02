@@ -27,10 +27,11 @@ func (e *Extension) SetFileOps(fileOps FileOps) {
 
 func (e *Extension) setPlatformDefaultDirectFileRoot() {
 	if runtime.GOOS == "android" {
-		dir := "/sdcard/Download/Taildrop"
-		if err := os.MkdirAll(dir, 0o700); err == nil {
-			e.directFileRoot = dir
-		}
+		// Root daemons use the profile-scoped inbox under --statedir. A
+		// separate receiver publishes completed files to the chosen shared
+		// directory, without changing the daemon or restarting a transfer.
+		// The Android app explicitly supplies SAF FileOps; that still selects
+		// direct mode in onChangeProfile, independently of this default.
 		return
 	}
 
