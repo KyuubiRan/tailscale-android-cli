@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"testing"
 )
@@ -19,7 +20,9 @@ func TestTreatAsLostUDP(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"non-nil", errors.New("foo"), false},
-		{"eperm", syscall.EPERM, true},
+		// Android includes Linux test files, but TreatAsLostUDP deliberately
+		// limits the firewall EPERM special case to GOOS=linux.
+		{"eperm", syscall.EPERM, runtime.GOOS == "linux"},
 		{
 			name: "operror",
 			err: &net.OpError{
@@ -29,7 +32,7 @@ func TestTreatAsLostUDP(t *testing.T) {
 					Err:     syscall.EPERM,
 				},
 			},
-			want: true,
+			want: runtime.GOOS == "linux",
 		},
 		{
 			name: "host_unreach",
